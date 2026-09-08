@@ -1,12 +1,17 @@
 """
 predict.py
-Baseline evaluation + detailed error analysis for Seq2Seq LSTM bAbI QA
+Evaluation + detailed error analysis for Seq2Seq LSTM with
+Additive Attention on bAbI QA Task 1.
+
+Run from the project root:
+    python predict.py
 """
 
+import os
 import pickle
 import numpy as np
 import pandas as pd
-from collections import Counter, defaultdict
+from collections import Counter
 
 from model import build_training_model, build_inference_models
 
@@ -18,7 +23,9 @@ from model import build_training_model, build_inference_models
 SEQ_DIR = "data/processed/sequences"
 VOCAB_DIR = "data/processed"
 TEST_CSV = "data/processed/test.csv"
-MODEL_PATH = "models/seq2seq_best.keras"
+
+# IMPORTANT: attention model
+MODEL_PATH = "models/seq2seq_attention_best.keras"
 
 BATCH_SIZE = 256
 
@@ -32,7 +39,10 @@ NUM_WRONG_EXAMPLES_TO_SHOW = 10
 
 def load_vocab():
 
-    with open(f"{VOCAB_DIR}/vocab.pkl", "rb") as f:
+    with open(
+        f"{VOCAB_DIR}/vocab.pkl",
+        "rb"
+    ) as f:
         vocab = pickle.load(f)
 
     tokenizer = vocab["tokenizer"]
@@ -52,14 +62,25 @@ def load_vocab():
     # Add padding representation
     index_word[pad_id] = ""
 
-    return tokenizer, index_word, sos_id, eos_id, pad_id
+    return (
+        tokenizer,
+        index_word,
+        sos_id,
+        eos_id,
+        pad_id
+    )
 
 
 # ============================================================
 # CONVERT TOKEN IDS TO WORDS
 # ============================================================
 
-def ids_to_words(id_seq, index_word, eos_id, pad_id):
+def ids_to_words(
+    id_seq,
+    index_word,
+    eos_id,
+    pad_id
+):
 
     words = []
 
@@ -72,14 +93,17 @@ def ids_to_words(id_seq, index_word, eos_id, pad_id):
             break
 
         words.append(
-            index_word.get(tok_id, f"<unk:{tok_id}>")
+            index_word.get(
+                tok_id,
+                f"<unk:{tok_id}>"
+            )
         )
 
     return words
 
 
 # ============================================================
-# GREEDY DECODING
+# GREEDY DECODING WITH ATTENTION
 # ============================================================
 
 def greedy_decode_batch(
@@ -95,8 +119,14 @@ def greedy_decode_batch(
     # --------------------------------------------------------
     # Encode the input
     # --------------------------------------------------------
-
-    state_h, state_c = encoder_model.predict(
+    #
+    # Attention model encoder returns:
+    #
+    #   encoder_outputs
+    #   state_h
+    #   state_c
+    #
+    encoder_outputs, state_h, state_c = encoder_model.predict(
         encoder_input,
         batch_size=BATCH_SIZE,
         verbose=0
@@ -112,7 +142,10 @@ def greedy_decode_batch(
         dtype=np.int32
     )
 
+    # --------------------------------------------------------
     # Store predicted token IDs
+    # --------------------------------------------------------
+
     decoded_ids = np.zeros(
         (n, max_decoder_len),
         dtype=np.int32
@@ -125,7 +158,12 @@ def greedy_decode_batch(
     for t in range(max_decoder_len):
 
         output_probs, state_h, state_c = decoder_model.predict(
-            [target_tok, state_h, state_c],
+            [
+                target_tok,
+                state_h,
+                state_c,
+                encoder_outputs
+            ],
             batch_size=BATCH_SIZE,
             verbose=0
         )
@@ -139,7 +177,10 @@ def greedy_decode_batch(
         decoded_ids[:, t] = sampled_ids
 
         # Feed prediction back into decoder
-        target_tok = sampled_ids.reshape(-1, 1)
+        target_tok = sampled_ids.reshape(
+            -1,
+            1
+        )
 
     return decoded_ids
 
@@ -158,7 +199,13 @@ def main():
     # Load vocabulary
     # --------------------------------------------------------
 
-    tokenizer, index_word, sos_id, eos_id, pad_id = load_vocab()
+    (
+        tokenizer,
+        index_word,
+        sos_id,
+        eos_id,
+        pad_id
+    ) = load_vocab()
 
     # --------------------------------------------------------
     # Load encoded test data
@@ -172,14 +219,8 @@ def main():
         f"{SEQ_DIR}/test_decoder_target.npy"
     )
 
-    # Sometimes decoder target has shape:
-    # (samples, sequence_length, 1)
-    #
-    # Convert to:
-    # (samples, sequence_length)
-
+    # Convert (N, T, 1) -> (N, T)
     if test_decoder_target.ndim == 3:
-
         test_decoder_target = test_decoder_target.squeeze(-1)
 
     # --------------------------------------------------------
@@ -188,7 +229,6 @@ def main():
 
     test_df = pd.read_csv(TEST_CSV)
 
-    # Check expected columns
     required_columns = [
         "context",
         "question",
@@ -212,9 +252,17 @@ def main():
     num_target_samples = test_decoder_target.shape[0]
     num_csv_samples = len(test_df)
 
-    print(f"Encoded test samples : {num_encoded_samples}")
-    print(f"Target test samples  : {num_target_samples}")
-    print(f"CSV test samples     : {num_csv_samples}")
+    print(
+        f"Encoded test samples : {num_encoded_samples}"
+    )
+
+    print(
+        f"Target test samples  : {num_target_samples}"
+    )
+
+    print(
+        f"CSV test samples     : {num_csv_samples}"
+    )
 
     if not (
         num_encoded_samples
@@ -223,7 +271,8 @@ def main():
     ):
 
         raise ValueError(
-            "Number of rows in .npy files and CSV do not match!"
+            "Number of rows in .npy files "
+            "and CSV do not match!"
         )
 
     # --------------------------------------------------------
@@ -233,8 +282,13 @@ def main():
     max_encoder_len = test_encoder_input.shape[1]
     max_decoder_len = test_decoder_target.shape[1]
 
-    print(f"max_encoder_len      : {max_encoder_len}")
-    print(f"max_decoder_len      : {max_decoder_len}")
+    print(
+        f"max_encoder_len      : {max_encoder_len}"
+    )
+
+    print(
+        f"max_decoder_len      : {max_decoder_len}"
+    )
 
     # ========================================================
     # VERIFY CSV / ENCODED TARGET ALIGNMENT
@@ -267,7 +321,9 @@ def main():
 
         decoded_answer = " ".join(true_words)
 
-        decoded_true_answers.append(decoded_answer)
+        decoded_true_answers.append(
+            decoded_answer
+        )
 
         if decoded_answer != csv_answers[i]:
 
@@ -281,13 +337,16 @@ def main():
 
     if len(alignment_mismatches) == 0:
 
-        print("CSV/.npy answer alignment: OK")
+        print(
+            "CSV/.npy answer alignment: OK"
+        )
 
     else:
 
         print(
             f"WARNING: Found "
-            f"{len(alignment_mismatches)} alignment mismatches."
+            f"{len(alignment_mismatches)} "
+            f"alignment mismatches."
         )
 
         print()
@@ -309,19 +368,29 @@ def main():
         )
 
     # ========================================================
-    # REBUILD MODEL
+    # REBUILD ATTENTION MODEL
     # ========================================================
 
     print()
     print("=" * 60)
-    print("REBUILDING MODEL")
+    print("REBUILDING ATTENTION MODEL")
     print("=" * 60)
 
-    vocab_size = len(tokenizer.word_index) + 1
+    vocab_size = len(
+        tokenizer.word_index
+    ) + 1
 
-    print(f"Vocabulary size: {vocab_size}")
-    print(f"Encoder length : {max_encoder_len}")
-    print(f"Decoder length : {max_decoder_len}")
+    print(
+        f"Vocabulary size: {vocab_size}"
+    )
+
+    print(
+        f"Encoder length : {max_encoder_len}"
+    )
+
+    print(
+        f"Decoder length : {max_decoder_len}"
+    )
 
     training_model, layers = build_training_model(
         vocab_size=vocab_size,
@@ -332,19 +401,28 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Load trained weights
+    # Load trained attention weights
     # --------------------------------------------------------
 
     print()
-    print(f"Loading weights from:")
-    print(MODEL_PATH)
+    print(
+        "Loading attention model weights from:"
+    )
 
-    training_model.load_weights(MODEL_PATH)
+    print(
+        MODEL_PATH
+    )
 
-    print("Weights loaded successfully.")
+    training_model.load_weights(
+        MODEL_PATH
+    )
+
+    print(
+        "Weights loaded successfully."
+    )
 
     # --------------------------------------------------------
-    # Build inference models
+    # Build attention inference models
     # --------------------------------------------------------
 
     latent_dim = 128
@@ -354,7 +432,10 @@ def main():
         latent_dim=latent_dim
     )
 
-    print("Inference models created successfully.")
+    print(
+        "Attention inference models "
+        "created successfully."
+    )
 
     # ========================================================
     # RUN PREDICTIONS
@@ -378,7 +459,9 @@ def main():
         max_decoder_len
     )
 
-    print("Prediction complete.")
+    print(
+        "Prediction complete."
+    )
 
     # ========================================================
     # EVALUATION
@@ -403,7 +486,7 @@ def main():
 
     for i in range(num_encoded_samples):
 
-        # Ground-truth answer
+        # Ground truth
         true_words = ids_to_words(
             test_decoder_target[i],
             index_word,
@@ -411,7 +494,7 @@ def main():
             pad_id
         )
 
-        # Predicted answer
+        # Prediction
         pred_words = ids_to_words(
             predicted_ids[i],
             index_word,
@@ -419,11 +502,21 @@ def main():
             pad_id
         )
 
-        true_answer = " ".join(true_words)
-        predicted_answer = " ".join(pred_words)
+        true_answer = " ".join(
+            true_words
+        )
 
-        actual_answers.append(true_answer)
-        predicted_answers.append(predicted_answer)
+        predicted_answer = " ".join(
+            pred_words
+        )
+
+        actual_answers.append(
+            true_answer
+        )
+
+        predicted_answers.append(
+            predicted_answer
+        )
 
         # Exact match
         is_match = (
@@ -431,11 +524,10 @@ def main():
         )
 
         if is_match:
-
             correct += 1
 
         # ----------------------------------------------------
-        # Save first few normal examples
+        # Save sample predictions
         # ----------------------------------------------------
 
         if len(sample_examples) < NUM_EXAMPLES_TO_SHOW:
@@ -450,7 +542,7 @@ def main():
             )
 
         # ----------------------------------------------------
-        # Save detailed wrong examples
+        # Save wrong examples
         # ----------------------------------------------------
 
         if not is_match:
@@ -471,7 +563,9 @@ def main():
     # OVERALL ACCURACY
     # ========================================================
 
-    accuracy = correct / num_encoded_samples
+    accuracy = (
+        correct / num_encoded_samples
+    )
 
     print()
     print("=" * 60)
@@ -486,16 +580,14 @@ def main():
     ) in sample_examples:
 
         if is_match:
-
             marker = "correct"
-
         else:
-
             marker = "WRONG"
 
         print(
             f"[{marker:<7}] "
-            f"'{true_answer}' -> '{predicted_answer}'"
+            f"'{true_answer}' -> "
+            f"'{predicted_answer}'"
         )
 
     print()
@@ -519,7 +611,9 @@ def main():
     print("GROUND-TRUTH ANSWER DISTRIBUTION")
     print("=" * 60)
 
-    answer_counter = Counter(actual_answers)
+    answer_counter = Counter(
+        actual_answers
+    )
 
     for answer, count in sorted(
         answer_counter.items()
@@ -549,10 +643,11 @@ def main():
         per_class_total[actual] += 1
 
         if actual == predicted:
-
             per_class_correct[actual] += 1
 
-    for answer in sorted(per_class_total):
+    for answer in sorted(
+        per_class_total
+    ):
 
         total = per_class_total[answer]
         class_correct = per_class_correct[answer]
@@ -590,7 +685,6 @@ def main():
                 (actual, predicted)
             ] += 1
 
-    # Sort by highest number of errors
     for (
         (actual, predicted),
         count
@@ -647,23 +741,28 @@ def main():
         print("-" * 60)
 
         print(
-            f"TEST INDEX    : {example['index']}"
+            f"TEST INDEX    : "
+            f"{example['index']}"
         )
 
         print(
-            f"CONTEXT       : {example['context']}"
+            f"CONTEXT       : "
+            f"{example['context']}"
         )
 
         print(
-            f"QUESTION      : {example['question']}"
+            f"QUESTION      : "
+            f"{example['question']}"
         )
 
         print(
-            f"GROUND TRUTH  : {example['ground_truth']}"
+            f"GROUND TRUTH  : "
+            f"{example['ground_truth']}"
         )
 
         print(
-            f"PREDICTION    : {example['prediction']}"
+            f"PREDICTION    : "
+            f"{example['prediction']}"
         )
 
     print("-" * 60)
@@ -678,11 +777,13 @@ def main():
     print("=" * 60)
 
     print(
-        f"Test samples     : {num_encoded_samples}"
+        f"Test samples     : "
+        f"{num_encoded_samples}"
     )
 
     print(
-        f"Correct           : {correct}"
+        f"Correct           : "
+        f"{correct}"
     )
 
     print(
@@ -696,7 +797,7 @@ def main():
     )
 
     print(
-        f"Alignment check   : PASSED"
+        "Alignment check   : PASSED"
     )
 
     print("=" * 60)
