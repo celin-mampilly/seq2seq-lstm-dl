@@ -1,40 +1,40 @@
 """
 model.py
 Seq2Seq LSTM with Additive Attention for bAbI QA Task 1.
+UPDATED VERSION: bidirectional encoder + dropout + larger capacity.
 
 Architecture:
 
     Encoder:
-        Embedding -> LSTM
+        Embedding -> Bidirectional(LSTM)
         |
-        +--> all encoder outputs (for attention)
+        +--> all encoder outputs, PROJECTED to latent_dim (for attention)
         |
-        +--> final hidden state + cell state
+        +--> final hidden/cell state, PROJECTED to latent_dim
+        |    (forward + backward concatenated, then Dense-projected down)
 
     Decoder:
-        Embedding -> LSTM
+        Embedding -> LSTM (unidirectional, initialized from encoder state)
                  |
                  v
-            Additive Attention
+            Additive Attention (query=decoder, key/value=encoder_outputs)
                  |
                  v
-        Concatenate decoder output
-        + attention context
+        Concatenate decoder output + attention context
                  |
                  v
         Dense(vocab_size, softmax)
 
-Two builders are provided:
+IMPORTANT: This is a different graph than the previous unidirectional
+version, so old .keras weight files are NOT compatible. You must
+retrain from scratch after swapping this in (train.py doesn't need
+to change, since it just calls build_training_model(...) and fits).
+
+Two builders are provided, same names/signatures as before so
+predict.py and train.py don't need interface changes:
 
     - build_training_model(...)
-        Model used during training with teacher forcing.
-
     - build_inference_models(...)
-        Encoder + decoder models used for token-by-token
-        greedy decoding during prediction.
-
-The SAME layer objects are shared between the training
-and inference models so that trained weights are reused.
 """
 
 import tensorflow as tf
@@ -44,6 +44,7 @@ from tensorflow.keras.layers import (
     Input,
     Embedding,
     LSTM,
+    Bidirectional,
     Dense,
     AdditiveAttention,
     Concatenate,
@@ -58,30 +59,18 @@ def build_training_model(
     vocab_size,
     max_encoder_len,
     max_decoder_len,
-    embedding_dim=64,
-    latent_dim=128,
+    embedding_dim=128,      # increased from 64
+    latent_dim=256,         # increased from 128
+    dropout=0.2,
+    recurrent_dropout=0.0,  # keep 0.0 unless you have GPU; CPU recurrent_dropout is very slow
 ):
     """
-    Builds the Seq2Seq LSTM model with Additive Attention.
-
-    Inputs:
-        encoder_input:
-            Padded context + question sequence.
-
-        decoder_input:
-            Decoder sequence shifted right, beginning with <sos>.
-
-    Output:
-        Softmax probability distribution over the vocabulary
-        for every decoder timestep.
+    Builds the Seq2Seq LSTM model with Additive Attention,
+    bidirectional encoder, and dropout regularization.
 
     Returns:
-        model:
-            Keras training model.
-
-        layers:
-            Dictionary containing shared layer objects used
-            later to construct inference models.
+        model:  Keras training model.
+        layers: dict of shared layer objects for build_inference_models.
     """
 
     # ========================================================
@@ -93,10 +82,6 @@ def build_training_model(
         name="encoder_input",
     )
 
-    # --------------------------------------------------------
-    # Encoder Embedding
-    # --------------------------------------------------------
-
     encoder_embedding = Embedding(
         input_dim=vocab_size,
         output_dim=embedding_dim,
@@ -104,34 +89,67 @@ def build_training_model(
         name="encoder_embedding",
     )
 
-    encoder_emb_out = encoder_embedding(
-        encoder_inputs
-    )
+    encoder_emb_out = encoder_embedding(encoder_inputs)
 
     # --------------------------------------------------------
-    # Encoder LSTM
+    # Bidirectional Encoder LSTM
     #
-    # IMPORTANT:
-    # return_sequences=True
-    #
-    # We need every hidden state for attention.
+    # Reading the context in both directions means the
+    # representation for an early sentence isn't only
+    # informed by what came before it, but also by what
+    # comes after - useful since the "relevant" sentence
+    # for a question can appear anywhere in a long context.
     # --------------------------------------------------------
 
-    encoder_lstm = LSTM(
-        latent_dim,
-        return_sequences=True,
-        return_state=True,
-        name="encoder_lstm",
+    encoder_bilstm = Bidirectional(
+        LSTM(
+            latent_dim,
+            return_sequences=True,
+            return_state=True,
+            dropout=dropout,
+            recurrent_dropout=recurrent_dropout,
+            name="encoder_lstm",
+        ),
+        name="encoder_bidirectional",
     )
 
-    encoder_outputs, state_h, state_c = encoder_lstm(
-        encoder_emb_out
+    (
+        encoder_outputs_raw,   # (batch, T_enc, 2*latent_dim)
+        forward_h, forward_c,
+        backward_h, backward_c,
+    ) = encoder_bilstm(encoder_emb_out)
+
+    # --------------------------------------------------------
+    # Merge forward/backward states, then project back down
+    # to latent_dim so the (unidirectional) decoder LSTM can
+    # be initialized with them directly.
+    # --------------------------------------------------------
+
+    state_h_concat = Concatenate(name="state_h_concat")(
+        [forward_h, backward_h]
+    )
+    state_c_concat = Concatenate(name="state_c_concat")(
+        [forward_c, backward_c]
     )
 
-    encoder_states = [
-        state_h,
-        state_c,
-    ]
+    state_h_dense = Dense(latent_dim, activation="tanh", name="state_h_proj")
+    state_c_dense = Dense(latent_dim, activation="tanh", name="state_c_proj")
+
+    state_h = state_h_dense(state_h_concat)
+    state_c = state_c_dense(state_c_concat)
+
+    encoder_states = [state_h, state_c]
+
+    # --------------------------------------------------------
+    # Also project encoder_outputs (2*latent_dim) down to
+    # latent_dim, so attention's key/value dimension matches
+    # the decoder's query dimension.
+    # --------------------------------------------------------
+
+    encoder_outputs_proj = Dense(
+        latent_dim, activation="tanh", name="encoder_outputs_proj"
+    )
+    encoder_outputs = encoder_outputs_proj(encoder_outputs_raw)
 
     # ========================================================
     # DECODER
@@ -142,10 +160,6 @@ def build_training_model(
         name="decoder_input",
     )
 
-    # --------------------------------------------------------
-    # Decoder Embedding
-    # --------------------------------------------------------
-
     decoder_embedding = Embedding(
         input_dim=vocab_size,
         output_dim=embedding_dim,
@@ -153,18 +167,14 @@ def build_training_model(
         name="decoder_embedding",
     )
 
-    decoder_emb_out = decoder_embedding(
-        decoder_inputs
-    )
-
-    # --------------------------------------------------------
-    # Decoder LSTM
-    # --------------------------------------------------------
+    decoder_emb_out = decoder_embedding(decoder_inputs)
 
     decoder_lstm = LSTM(
         latent_dim,
         return_sequences=True,
         return_state=True,
+        dropout=dropout,
+        recurrent_dropout=recurrent_dropout,
         name="decoder_lstm",
     )
 
@@ -177,36 +187,10 @@ def build_training_model(
     # ADDITIVE ATTENTION
     # ========================================================
 
-    attention = AdditiveAttention(
-        name="attention",
-    )
-
-    # --------------------------------------------------------
-    # Attention:
-    #
-    # Query:
-    #   decoder hidden states
-    #
-    # Key/Value:
-    #   encoder hidden states
-    #
-    # Shape:
-    #
-    # decoder_seq_out:
-    #     (batch, decoder_length, latent_dim)
-    #
-    # encoder_outputs:
-    #     (batch, encoder_length, latent_dim)
-    #
-    # attention_output:
-    #     (batch, decoder_length, latent_dim)
-    # --------------------------------------------------------
+    attention = AdditiveAttention(name="attention")
 
     attention_output = attention(
-        [
-            decoder_seq_out,
-            encoder_outputs,
-        ]
+        [decoder_seq_out, encoder_outputs]
     )
 
     # ========================================================
@@ -214,50 +198,24 @@ def build_training_model(
     # ========================================================
 
     combined_output = Concatenate(
-        axis=-1,
-        name="decoder_attention_concat",
-    )(
-        [
-            decoder_seq_out,
-            attention_output,
-        ]
-    )
-
-    # Combined dimension:
-    #
-    # decoder output = 128
-    # attention output = 128
-    #
-    # total = 256
-    #
-    # The Dense layer maps this back to vocabulary size.
+        axis=-1, name="decoder_attention_concat"
+    )([decoder_seq_out, attention_output])
 
     decoder_dense = Dense(
-        vocab_size,
-        activation="softmax",
-        name="decoder_dense",
+        vocab_size, activation="softmax", name="decoder_dense"
     )
 
-    decoder_outputs = decoder_dense(
-        combined_output
-    )
+    decoder_outputs = decoder_dense(combined_output)
 
     # ========================================================
     # COMPLETE MODEL
     # ========================================================
 
     model = Model(
-        [
-            encoder_inputs,
-            decoder_inputs,
-        ],
+        [encoder_inputs, decoder_inputs],
         decoder_outputs,
-        name="seq2seq_babi_attention",
+        name="seq2seq_babi_attention_bidir",
     )
-
-    # --------------------------------------------------------
-    # Compile
-    # --------------------------------------------------------
 
     model.compile(
         optimizer="adam",
@@ -265,21 +223,16 @@ def build_training_model(
         metrics=["accuracy"],
     )
 
-    # ========================================================
-    # SHARED LAYERS
-    # ========================================================
-
     layers = {
         "encoder_inputs": encoder_inputs,
-
         "encoder_embedding": encoder_embedding,
-        "encoder_lstm": encoder_lstm,
-
+        "encoder_bilstm": encoder_bilstm,
+        "state_h_dense": state_h_dense,
+        "state_c_dense": state_c_dense,
+        "encoder_outputs_proj": encoder_outputs_proj,
         "decoder_embedding": decoder_embedding,
         "decoder_lstm": decoder_lstm,
-
         "attention": attention,
-
         "decoder_dense": decoder_dense,
     }
 
@@ -292,186 +245,87 @@ def build_training_model(
 
 def build_inference_models(
     layers,
-    latent_dim=128,
+    latent_dim=256,   # must match the value used in build_training_model
 ):
     """
-    Builds the encoder and decoder models used during
-    inference / prediction.
+    Builds the encoder and decoder models used during inference.
+    Same shapes as before from predict.py's point of view:
 
-    Encoder:
+        encoder_model:  encoder_input -> [encoder_outputs, state_h, state_c]
+        decoder_model:  [token, state_h, state_c, encoder_outputs]
+                            -> [token_probs, state_h, state_c]
 
-        encoder_input
-            |
-            v
-        encoder outputs
-        + state_h
-        + state_c
-
-    Decoder:
-
-        decoder token
-        + previous state_h
-        + previous state_c
-        + encoder outputs
-            |
-            v
-        decoder LSTM
-            |
-            v
-        attention
-            |
-            v
-        Dense
-            |
-            v
-        next token probabilities
+    predict.py does NOT need to change - it calls this the same way.
     """
 
-    # ========================================================
-    # GET SHARED LAYERS
-    # ========================================================
+    encoder_inputs = layers["encoder_inputs"]
+    encoder_embedding = layers["encoder_embedding"]
+    encoder_bilstm = layers["encoder_bilstm"]
+    state_h_dense = layers["state_h_dense"]
+    state_c_dense = layers["state_c_dense"]
+    encoder_outputs_proj = layers["encoder_outputs_proj"]
 
-    encoder_inputs = layers[
-        "encoder_inputs"
-    ]
-
-    encoder_embedding = layers[
-        "encoder_embedding"
-    ]
-
-    encoder_lstm = layers[
-        "encoder_lstm"
-    ]
-
-    decoder_embedding = layers[
-        "decoder_embedding"
-    ]
-
-    decoder_lstm = layers[
-        "decoder_lstm"
-    ]
-
-    attention = layers[
-        "attention"
-    ]
-
-    decoder_dense = layers[
-        "decoder_dense"
-    ]
+    decoder_embedding = layers["decoder_embedding"]
+    decoder_lstm = layers["decoder_lstm"]
+    attention = layers["attention"]
+    decoder_dense = layers["decoder_dense"]
 
     # ========================================================
     # ENCODER INFERENCE MODEL
     # ========================================================
 
-    encoder_emb_out = encoder_embedding(
-        encoder_inputs
-    )
+    encoder_emb_out = encoder_embedding(encoder_inputs)
 
-    encoder_outputs, state_h, state_c = encoder_lstm(
-        encoder_emb_out
-    )
+    (
+        encoder_outputs_raw,
+        forward_h, forward_c,
+        backward_h, backward_c,
+    ) = encoder_bilstm(encoder_emb_out)
+
+    state_h_concat = Concatenate()([forward_h, backward_h])
+    state_c_concat = Concatenate()([forward_c, backward_c])
+
+    state_h = state_h_dense(state_h_concat)
+    state_c = state_c_dense(state_c_concat)
+
+    encoder_outputs = encoder_outputs_proj(encoder_outputs_raw)
 
     encoder_model = Model(
         encoder_inputs,
-        [
-            encoder_outputs,
-            state_h,
-            state_c,
-        ],
+        [encoder_outputs, state_h, state_c],
         name="encoder_inference",
     )
 
     # ========================================================
-    # DECODER INFERENCE INPUTS
+    # DECODER INFERENCE MODEL
     # ========================================================
 
-    # One token at a time
-    decoder_single_input = Input(
-        shape=(1,),
-        name="decoder_single_token_input",
-    )
+    decoder_single_input = Input(shape=(1,), name="decoder_single_token_input")
+    decoder_state_input_h = Input(shape=(latent_dim,), name="decoder_state_h_input")
+    decoder_state_input_c = Input(shape=(latent_dim,), name="decoder_state_c_input")
 
-    # Previous decoder hidden state
-    decoder_state_input_h = Input(
-        shape=(latent_dim,),
-        name="decoder_state_h_input",
-    )
-
-    # Previous decoder cell state
-    decoder_state_input_c = Input(
-        shape=(latent_dim,),
-        name="decoder_state_c_input",
-    )
-
-    # --------------------------------------------------------
-    # Encoder outputs are required by attention.
-    #
-    # During inference, the encoder produces:
-    #
-    # (batch, encoder_length, latent_dim)
-    # --------------------------------------------------------
-
+    # NOTE: shape is (None, latent_dim) since encoder_outputs is
+    # already projected down to latent_dim above.
     encoder_outputs_input = Input(
-        shape=(None, latent_dim),
-        name="encoder_outputs_input",
+        shape=(None, latent_dim), name="encoder_outputs_input"
     )
 
-    # ========================================================
-    # DECODER EMBEDDING
-    # ========================================================
-
-    decoder_emb = decoder_embedding(
-        decoder_single_input
-    )
-
-    # ========================================================
-    # ONE DECODER STEP
-    # ========================================================
+    decoder_emb = decoder_embedding(decoder_single_input)
 
     decoder_seq_out, decoder_state_h, decoder_state_c = decoder_lstm(
         decoder_emb,
-        initial_state=[
-            decoder_state_input_h,
-            decoder_state_input_c,
-        ],
+        initial_state=[decoder_state_input_h, decoder_state_input_c],
     )
-
-    # ========================================================
-    # ATTENTION
-    # ========================================================
 
     attention_output = attention(
-        [
-            decoder_seq_out,
-            encoder_outputs_input,
-        ]
+        [decoder_seq_out, encoder_outputs_input]
     )
-
-    # ========================================================
-    # COMBINE DECODER + ATTENTION
-    # ========================================================
 
     combined_output = Concatenate(
-        axis=-1,
-        name="inference_attention_concat",
-    )(
-        [
-            decoder_seq_out,
-            attention_output,
-        ]
-    )
+        axis=-1, name="inference_attention_concat"
+    )([decoder_seq_out, attention_output])
 
-    # ========================================================
-    # PREDICT NEXT TOKEN
-    # ========================================================
-
-    decoder_token_probs = decoder_dense(
-        combined_output
-    )
-
-    # ========================================================
-    # COMPLETE DECODER MODEL
-    # ========================================================
+    decoder_token_probs = decoder_dense(combined_output)
 
     decoder_model = Model(
         [
@@ -480,11 +334,7 @@ def build_inference_models(
             decoder_state_input_c,
             encoder_outputs_input,
         ],
-        [
-            decoder_token_probs,
-            decoder_state_h,
-            decoder_state_c,
-        ],
+        [decoder_token_probs, decoder_state_h, decoder_state_c],
         name="decoder_inference",
     )
 

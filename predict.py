@@ -3,6 +3,10 @@ predict.py
 Evaluation + detailed error analysis for Seq2Seq LSTM with
 Additive Attention on bAbI QA Task 1.
 
+UPDATED: now points at the bidirectional attention model
+(embedding_dim=128, latent_dim=256) and saves per-example
+predictions to results/predictions.csv for visualize_results.py.
+
 Run from the project root:
     python predict.py
 """
@@ -24,8 +28,12 @@ SEQ_DIR = "data/processed/sequences"
 VOCAB_DIR = "data/processed"
 TEST_CSV = "data/processed/test.csv"
 
-# IMPORTANT: attention model
-MODEL_PATH = "models/seq2seq_attention_best.keras"
+# IMPORTANT: bidirectional attention model (updated architecture)
+MODEL_PATH = "models/seq2seq_attention_bidir_best.keras"
+
+# Must match model.py / train.py for the new bidirectional model.
+EMBEDDING_DIM = 128
+LATENT_DIM = 256
 
 BATCH_SIZE = 256
 
@@ -368,12 +376,12 @@ def main():
         )
 
     # ========================================================
-    # REBUILD ATTENTION MODEL
+    # REBUILD ATTENTION MODEL (BIDIRECTIONAL)
     # ========================================================
 
     print()
     print("=" * 60)
-    print("REBUILDING ATTENTION MODEL")
+    print("REBUILDING BIDIRECTIONAL ATTENTION MODEL")
     print("=" * 60)
 
     vocab_size = len(
@@ -392,12 +400,20 @@ def main():
         f"Decoder length : {max_decoder_len}"
     )
 
+    print(
+        f"embedding_dim  : {EMBEDDING_DIM}"
+    )
+
+    print(
+        f"latent_dim     : {LATENT_DIM}"
+    )
+
     training_model, layers = build_training_model(
         vocab_size=vocab_size,
         max_encoder_len=max_encoder_len,
         max_decoder_len=max_decoder_len,
-        embedding_dim=64,
-        latent_dim=128
+        embedding_dim=EMBEDDING_DIM,
+        latent_dim=LATENT_DIM
     )
 
     # --------------------------------------------------------
@@ -425,7 +441,7 @@ def main():
     # Build attention inference models
     # --------------------------------------------------------
 
-    latent_dim = 128
+    latent_dim = LATENT_DIM
 
     encoder_model, decoder_model = build_inference_models(
         layers,
@@ -558,6 +574,27 @@ def main():
                     "prediction": predicted_answer
                 }
             )
+
+    # ========================================================
+    # SAVE PER-EXAMPLE RESULTS (for visualize_results.py)
+    # ========================================================
+
+    results_df = pd.DataFrame({
+        "index": range(num_encoded_samples),
+        "context": test_df["context"].astype(str).tolist(),
+        "question": test_df["question"].astype(str).tolist(),
+        "ground_truth": actual_answers,
+        "prediction": predicted_answers,
+        "correct": [
+            a == p for a, p in zip(actual_answers, predicted_answers)
+        ],
+    })
+
+    os.makedirs("results", exist_ok=True)
+    results_df.to_csv("results/predictions.csv", index=False)
+
+    print()
+    print(f"Saved per-example predictions to results/predictions.csv")
 
     # ========================================================
     # OVERALL ACCURACY

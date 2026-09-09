@@ -4,6 +4,11 @@ Loads the preprocessed .npy sequence arrays + vocab.pkl produced by
 data/prepare_sequences.py, builds the Seq2Seq LSTM model with attention
 from model.py, and trains it with teacher forcing.
 
+UPDATED: hyperparameters bumped to match the new bidirectional
+model.py (embedding_dim=128, latent_dim=256), plus a
+ReduceLROnPlateau scheduler added alongside the existing
+EarlyStopping/ModelCheckpoint/CSVLogger callbacks.
+
 Run from the project root:
     python train.py
 """
@@ -16,6 +21,7 @@ from tensorflow.keras.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
     CSVLogger,
+    ReduceLROnPlateau,
 )
 
 from model import build_training_model
@@ -51,8 +57,12 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM = 64
-LATENT_DIM = 128
+# IMPORTANT: these must match the defaults in the updated model.py
+# (bidirectional encoder version). If you change one, change both,
+# or predict.py's build_inference_models(..., latent_dim=...) call
+# will fail to load these weights correctly.
+EMBEDDING_DIM = 128   # was 64
+LATENT_DIM = 256       # was 128
 
 BATCH_SIZE = 64
 EPOCHS = 50
@@ -110,7 +120,7 @@ def load_split(split_name):
 def main():
 
     print("=" * 70)
-    print("TRAINING SEQ2SEQ LSTM WITH ADDITIVE ATTENTION")
+    print("TRAINING SEQ2SEQ LSTM WITH ADDITIVE ATTENTION (BIDIRECTIONAL)")
     print("=" * 70)
 
     # -----------------------------------------------------------------------
@@ -212,10 +222,12 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # Build attention model
+    # Build attention model (bidirectional encoder version)
     # -----------------------------------------------------------------------
     print()
-    print("Building attention model...")
+    print("Building bidirectional attention model...")
+    print(f"embedding_dim = {EMBEDDING_DIM}")
+    print(f"latent_dim    = {LATENT_DIM}")
 
     model, layers = build_training_model(
         vocab_size=vocab_size,
@@ -244,12 +256,12 @@ def main():
     # Do NOT overwrite the baseline model.
     checkpoint_path = os.path.join(
         MODEL_DIR,
-        "seq2seq_attention_best.keras"
+        "seq2seq_attention_bidir_best.keras"
     )
 
     log_path = os.path.join(
         MODEL_DIR,
-        "attention_training_log.csv"
+        "attention_bidir_training_log.csv"
     )
 
     callbacks = [
@@ -263,8 +275,20 @@ def main():
 
         EarlyStopping(
             monitor="val_loss",
-            patience=5,
+            patience=8,
             restore_best_weights=True,
+            verbose=1,
+        ),
+
+        # NEW: reduce the learning rate when validation loss plateaus.
+        # This is especially useful for the larger (256-unit) model,
+        # since a bigger model can overshoot / oscillate around a
+        # good minimum with a constant learning rate.
+        ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-5,
             verbose=1,
         ),
 
@@ -304,7 +328,7 @@ def main():
 
     final_path = os.path.join(
         MODEL_DIR,
-        "seq2seq_attention_final.keras"
+        "seq2seq_attention_bidir_final.keras"
     )
 
     model.save(final_path)
